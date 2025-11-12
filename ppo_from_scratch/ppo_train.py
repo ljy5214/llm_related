@@ -43,9 +43,9 @@ class Critic(nn.Module):
     def forward(self, input_ids, attention_mask, num_actions):
         
         
-        hidden_state = self.base_model(input_ids, attention_mask=attention_mask).last_hidden_state
-        value_model_output = self.value_head(hidden_state)
-        values = value_model_output.squeeze(-1)[:, -num_actions:]
+        hidden_state = self.base_model(input_ids, attention_mask=attention_mask).last_hidden_state # (batch_size, seq_len, hidden_size)
+        value_model_output = self.value_head(hidden_state) #(batch_size, seq_len， 1)
+        values = value_model_output.squeeze(-1)[:, -num_actions:] # (batch_size, seq_len)
         return values
 
 
@@ -144,12 +144,14 @@ def compute_approx_kl(
     ref_log_probs: torch.Tensor,
     action_mask: Optional[torch.Tensor] = None,
 ):
-
+    #	•	log_probs: (B, T) —— 来自 actor 的逐 token 对数概率
+	#•	ref_log_probs: (B, T) —— 来自参考模型的逐 token 对数概率
+	#•	action_mask（可选）: (B, T)，或任何可与前两者在最后一维广播对齐的形状（如 (B, T, 1)）
     log_ratio = log_probs.float() - ref_log_probs.float()
     if action_mask is not None:
         log_ratio = log_ratio * action_mask
 
-    return log_ratio
+    return log_ratio #(B, T)
 
 # A(t) = R(t) + gam*V(t+1) - V(t)
 # gae:A(t) = R(t) + gam*V(t+1) - V(t) + gam*lam*A(t+1)
@@ -188,6 +190,9 @@ def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_p
         prompts = all_prompts[i:i+micro_rollout_batch_size]
         inputs = actor_tokenizer(prompts, padding='max_length', max_length=max_length, truncation=True, return_tensors='pt')
         input_ids = inputs['input_ids']
+
+        # 这里可能还需要再看看，transformers的推理
+        # 这里返回结果是(B, M+T)包含原始 prompt（前 M 位）+ 生成（后 T 位）。
         seqs = model.generate(**inputs.to(device), 
                             max_new_tokens = max_new_tokens, 
                             eos_token_id = eos_token_id, 
@@ -196,9 +201,11 @@ def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_p
             seqs = seqs[:, :max_new_tokens + max_length]
         else:
             seqs = torch.cat([seqs, torch.full((seqs.size(0), max_new_tokens + max_length - seqs.size(1)), fill_value=pad_token_id, device=seqs.device)], dim=1)
-            
+
+        # 这里是需要识别是否是padding字符，eos_token并不算padding 
         attention_mask = (seqs.ne(pad_token_id)).to(dtype=torch.long)
         ans = seqs[:, input_ids.size(1):]
+        # 这里计算的是需要进行梯度更新的动作，因此eostoken并不参与到梯度更新中
         action_mask = (ans.ne(eos_token_id) & ans.ne(pad_token_id)).to(dtype=torch.long)
        
 
@@ -218,18 +225,23 @@ def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_p
 
 def compute_rewards(kl, r, action_mask, kl_ctl, clip_reward_value):
 
-        kl_divergence_estimate = -kl_ctl * kl
+        # 把kl散度的负数，分配到奖励中
+        # [b，acttion_num]
+        kl_divergence_estimate = -kl_ctl * kl #逐元素相乘 → kl_divergence_estimate：(B, T)
         rewards = kl_divergence_estimate
 
+        # (B,)，表示每条样本有效 token 数 K
         ends = action_mask.sum(1) + 1
-        
         if not isinstance(clip_reward_value, torch.Tensor):
             clip_reward_value = torch.tensor(clip_reward_value).to(r.device)
-    
+
+        # 对 r 做逐元素截断（clamp），把奖励值限制在 [-clip_reward_value, +clip_reward_value] 区间内，防止奖励过大/过小导致不稳定：
+        # r : (B, 1)
         reward_clip = torch.clamp(r, -clip_reward_value,
                                   clip_reward_value)
         batch_size = r.size(0)
         for j in range(batch_size):
+            # 这里应该是在《eos》这个token上加reward-model的结果
             rewards[j, :ends[j]][-1] += reward_clip[j, 0]
 
         return rewards
@@ -249,26 +261,43 @@ def generate_experiences(samples_list):
         action_mask = samples.action_mask
         num_actions = samples.num_actions
         with torch.no_grad():
-            # 计算策略模型输出token的概率
+            ## 计算策略模型输出token的概率
+            # seqs: [batch_size, seq_len]
+            # 这里调用的是forward函数，返回维度为【batch_size, seq_len, vocab_size】，下一个token的概率
+            # 如果是generate，则是在内部调用多次forward，返回结果是(B×num_return_sequences, M+T)包含原始 prompt（前 M 位）+ 生成（后 T 位）。
             output = actor_model(seqs, attention_mask=attention_mask)
-            logits = output.logits
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-            log_probs_labels = log_probs.gather(dim=-1, index=seqs[:, 1:].unsqueeze(-1))
+            logits = output.logits # (B, L, V) 
+ 
+            # 需要排除掉最后一个token
+            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1) #(B, L-1, V) 
+            # 向后取一位
+            # seqs[:, 1:].unsqueeze(-1) ⇒ (B, L-1, 1)，且元素是 token id，范围在 [0, V-1]
+            # log_probs_labels[b, t, 0] = log_probs[b, t, y[b, t]]
+            # 每一个token对应的label（下一个token）的概率
+            log_probs_labels = log_probs.gather(dim=-1, index=seqs[:, 1:].unsqueeze(-1)) #(B, L-1, 1)
             action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
-            #计算参考模型输出token的概率
+
+            ##计算参考模型输出token的概率
             ref_output = ref_model(seqs, attention_mask=attention_mask)
             ref_logits = ref_output.logits
             ref_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
             ref_log_probs_labels = ref_log_probs.gather(dim=-1, index=seqs[:, 1:].unsqueeze(-1))
             ref_action_log_probs = ref_log_probs_labels.squeeze(-1)[:, -num_actions:]
-            # 计算价值
+
+            ## 计算价值
+            # batch_size, seq_len
             value = critic_model.forward(seqs, attention_mask, num_actions).to(device)
             # 转换成文本
             seq_texts = actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
-            # 计算奖励模型的奖励值
+            # 计算奖励模型的奖励值 
+            # 这里需要先decode再encode，是因为reward model和actor model的词表可能不太一样
             reward_model_inputs = reward_tokenizer(seq_texts, return_tensors="pt", padding=True)
+
+            # 维度猜测是 【b，1】
             r = reward_model(**reward_model_inputs.to(device)).logits # 奖励模型的输出，相当于生成最后一个token的奖励（结果奖励模型）
             # 计算kl散度
+
+            # 结果是 [b，acttion_num]
             kl = compute_approx_kl(
                     action_log_probs,
                     ref_action_log_probs,
@@ -383,6 +412,7 @@ def train():
     steps = 0
     for episode in range(episodes):
         for rand_prompts in prompts_dataloader:
+            # 这里取rollout_batch_size个样本
             # 生成样本（获取模型推理结果）
             samples = generate_samples(rand_prompts, actor_model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size)
             # 生成经验（获取优势、奖励、回报等）
@@ -429,6 +459,10 @@ if __name__ == "__main__":
     actor_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/Qwen2.5-0.5B-Instruct')
     reward_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2')
     # 价值模型
+
+    #	你传入的是 actor_model.base_model。在 🤗Transformers 里，AutoModelForCausalLM 由两部分构成：
+	# base_model：Transformer 主体，输出 last_hidden_state ∈ ℝ^{B×L×H}；
+	# lm_head：把隐藏维 H 投到词表维 V 的线性层（或 MLP），输出 logits。
     critic_model = Critic(actor_model.base_model).to(device)
     
     # 初始化优化器
