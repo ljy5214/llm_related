@@ -28,23 +28,23 @@ class KGTrainer(Trainer):
         preprocess_logits_for_metrics = None,
     ):
         super().__init__(
-            model,
-            args,
-            data_collator,
-            train_dataset,
-            eval_dataset,
-            tokenizer,
-            model_init,
-            compute_metrics,
-            callbacks,
-            optimizers,
-            preprocess_logits_for_metrics,
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            model_init=model_init,
+            compute_metrics=compute_metrics,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
         self.teacher_model = teacher_model
         self.if_use_entropy = if_use_entropy
         
     
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         
         outputs = model(**inputs)
         with torch.no_grad():
@@ -64,7 +64,7 @@ class KGTrainer(Trainer):
             teacher_logits = teacher_logits[:, :, :logits.shape[-1]]
         
         labels = inputs['labels']
-        kl = compute_fkl(logits, teacher_logits, labels, padding_id=-100, temp=2.0)
+        kl = compute_fkl(logits, teacher_logits, labels, padding_id=-100, temp=2.0).mean()
         
         if self.if_use_entropy:
             loss_total = 0.5 * kl + 0.5 * loss
